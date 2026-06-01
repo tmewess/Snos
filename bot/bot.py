@@ -1401,10 +1401,27 @@ async def adm_back(call: types.CallbackQuery, state: FSMContext):
     await show_admin(call.message)
     await call.answer()
 
+
+# ── HTTP сервер для Render ───────────────────────────────────────────────────
+from aiohttp import web
+
+async def health(request):
+    return web.Response(text="OK")
+
+async def start_web():
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.getenv("PORT", 10000))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+
 # ── Запуск ─────────────────────────────────────────────────────────────────
 async def main():
     init_db()
     logger.info("ExtraSnos bot starting...")
+    await start_web()
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
