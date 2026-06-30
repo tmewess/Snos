@@ -283,6 +283,7 @@ class AdminStates(StatesGroup):
     give_snos_user = State()
     give_snos_amount = State()
     ban_user = State()
+    unban_user = State()
     add_admin_id = State()
     remove_admin_id = State()
 
@@ -387,6 +388,12 @@ async def cmd_start(message: types.Message, state: FSMContext):
             referrer_id = None
 
     existing = get_user(user_id)
+
+    # ── БАГ 2 ИСПРАВЛЕН: проверка бана ──────────────────────────────────────
+    if existing and existing["is_banned"]:
+        await message.answer("🚫 Вы заблокированы и не можете использовать этого бота.")
+        return
+
     create_user(user_id, username, full_name, referrer_id)
 
     # Админы не проходят проверку подписок
@@ -395,6 +402,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
         if channels:
             not_subbed = await check_subscriptions(user_id)
             if not_subbed:
+                # ── БАГ 1 ИСПРАВЛЕН: сохраняем реферера в state до раннего выхода ──
+                if not existing and referrer_id:
+                    await state.update_data(pending_referrer=referrer_id)
                 text = c(
                     f"🛡 <b>ExtraSnos</b>\n\n"
                     f"Для доступа к боту подпишитесь на все каналы ниже.\n"
@@ -429,6 +439,11 @@ async def cmd_start(message: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "check_sub")
 async def check_sub_callback(call: types.CallbackQuery, state: FSMContext):
     user_id = call.from_user.id
+    # ── Проверка бана при нажатии «Я подписался» ─────────────────────────────
+    user_check = get_user(user_id)
+    if user_check and user_check["is_banned"]:
+        await call.answer("🚫 Вы заблокированы.", show_alert=True)
+        return
     channels = get_channels()
     if channels:
         not_subbed = await check_subscriptions(user_id)
@@ -747,6 +762,7 @@ async def show_admin(message):
         [InlineKeyboardButton(text="🪞 Все зеркала", callback_data="adm_mirrors")],
         [InlineKeyboardButton(text="📋 История сносов", callback_data="adm_snos_history")],
         [InlineKeyboardButton(text="🚫 Заблокировать юзера", callback_data="adm_ban")],
+        [InlineKeyboardButton(text="✅ Разбанить юзера", callback_data="adm_unban")],
         [InlineKeyboardButton(text="📊 Топ рефоводов", callback_data="adm_ref_stats")],
         [InlineKeyboardButton(text="🗑 Очистить историю сносов", callback_data="adm_clear_snos")]
     ])
@@ -1353,12 +1369,50 @@ async def do_ban(message: types.Message, state: FSMContext):
         return
     try:
         uid = int(message.text.strip())
+        if uid == SUPER_ADMIN_ID or is_admin(uid):
+            await message.answer("❌ Нельзя заблокировать администратора.")
+            return
         conn = get_db()
-        conn.execute("DELETE FROM users WHERE user_id=?", (uid,))
+        # ── БАГ 2 ИСПРАВЛЕН: ставим is_banned=1 вместо удаления из базы ──────
+        conn.execute("UPDATE users SET is_banned=1 WHERE user_id=?", (uid,))
         conn.commit()
         conn.close()
         await state.clear()
-        await message.answer(f"✅ Пользователь <code>{uid}</code> удалён из базы.", parse_mode="HTML")
+        await message.answer(f"✅ Пользователь <code>{uid}</code> заблокирован.", parse_mode="HTML")
+        try:
+            await bot.send_message(uid, "🚫 Вы заблокированы администратором.")
+        except Exception:
+            pass
+    except ValueError:
+        await message.answer("❌ Введите числовой ID")
+
+@dp.callback_query(F.data == "adm_unban")
+async def adm_unban(call: types.CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user.id):
+        return
+    await state.set_state(AdminStates.unban_user)
+    await call.message.edit_text(
+        "✅ <b>Разблокировка пользователя</b>\n\nВведите ID пользователя:",
+        reply_markup=back_keyboard("adm_back"), parse_mode="HTML"
+    )
+    await call.answer()
+
+@dp.message(AdminStates.unban_user)
+async def do_unban(message: types.Message, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    try:
+        uid = int(message.text.strip())
+        conn = get_db()
+        conn.execute("UPDATE users SET is_banned=0 WHERE user_id=?", (uid,))
+        conn.commit()
+        conn.close()
+        await state.clear()
+        await message.answer(f"✅ Пользователь <code>{uid}</code> разблокирован.", parse_mode="HTML")
+        try:
+            await bot.send_message(uid, "✅ Вы были разблокированы администратором. Напишите /start.")
+        except Exception:
+            pass
     except ValueError:
         await message.answer("❌ Введите числовой ID")
 
@@ -1397,7 +1451,11 @@ async def adm_back(call: types.CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         return
     await state.clear()
-    await call.message.delete()
+    # ── БАГ 3 ИСПРАВЛЕН: оборачиваем delete в try/except ────────────────────
+    try:
+        await call.message.delete()
+    except Exception:
+        pass
     await show_admin(call.message)
     await call.answer()
 
@@ -1413,7 +1471,7 @@ async def start_web():
     app.router.add_get("/", health)
     runner = web.AppRunner(app)
     await runner.setup()
-    port = int(os.getenv("PORT", 10000))
+    port = int(os.getenv("PORT", 8000))
     site = web.TCPSite(runner, "0.0.0.0", port)
     await site.start()
 
