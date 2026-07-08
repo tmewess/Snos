@@ -35,6 +35,7 @@ class MirrorContextMiddleware(BaseMiddleware):
     """
     Sets mirror_admin_id_var to the mirror creator's user_id so that
     is_admin() treats the creator as admin inside their own mirror bot.
+    The token is always reset in finally to prevent stale context.
     """
     async def __call__(
         self,
@@ -42,6 +43,7 @@ class MirrorContextMiddleware(BaseMiddleware):
         event: TelegramObject,
         data: Dict[str, Any],
     ) -> Any:
+        ctx_token = None
         bot_instance: Bot = data.get("bot")
         if bot_instance and bot_instance.token != bot.token:
             conn = get_db()
@@ -51,21 +53,43 @@ class MirrorContextMiddleware(BaseMiddleware):
             ).fetchone()
             conn.close()
             if mirror:
-                mirror_admin_id_var.set(mirror["user_id"])
-        return await handler(event, data)
+                ctx_token = mirror_admin_id_var.set(mirror["user_id"])
+        try:
+            return await handler(event, data)
+        finally:
+            # FIX: always reset context to avoid stale admin identity leaking
+            if ctx_token is not None:
+                mirror_admin_id_var.reset(ctx_token)
 
 
 async def _run_mirror_polling(mirror_id: int, token: str) -> None:
-    """Run a mirror bot with the given token until cancelled."""
+    """
+    Run a mirror bot polling loop using dp.feed_update() so we don't conflict
+    with the main bot's dp.start_polling() or its signal handlers.
+    """
     mirror_bot = Bot(token=token)
+    offset: int = 0
     try:
         logger.info(f"Starting mirror bot (id={mirror_id}) ...")
-        await dp.start_polling(mirror_bot)
+        await mirror_bot.delete_webhook(drop_pending_updates=False)
+        allowed_updates = dp.resolve_used_update_types()
+        while True:
+            try:
+                updates = await mirror_bot.get_updates(
+                    offset=offset,
+                    timeout=10,
+                    allowed_updates=allowed_updates,
+                )
+                for update in updates:
+                    offset = update.update_id + 1
+                    await dp.feed_update(mirror_bot, update)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"Mirror bot (id={mirror_id}) polling error: {e}")
+                await asyncio.sleep(2)
     except asyncio.CancelledError:
         logger.info(f"Mirror bot (id={mirror_id}) cancelled.")
-        raise
-    except Exception as e:
-        logger.error(f"Mirror bot (id={mirror_id}) crashed: {e}")
     finally:
         try:
             await mirror_bot.session.close()
@@ -542,6 +566,9 @@ async def check_sub_callback(call: types.CallbackQuery, state: FSMContext, bot: 
     referrer_id = data.get("pending_referrer")
 
     if referrer_id:
+        # FIX: clear pending_referrer immediately to prevent double-credit on
+        # repeated taps or duplicate callback deliveries
+        await state.update_data(pending_referrer=None)
         existing_check = get_user(user_id)
         ref_user = get_user(referrer_id)
         if ref_user and existing_check and existing_check["referrer_id"] == referrer_id:
