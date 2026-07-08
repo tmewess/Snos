@@ -44,22 +44,96 @@ class MirrorContextMiddleware(BaseMiddleware):
         data: Dict[str, Any],
     ) -> Any:
         ctx_token = None
-        bot_instance: Bot = data.get("bot")
-        if bot_instance and bot_instance.token != bot.token:
-            conn = get_db()
-            mirror = conn.execute(
-                "SELECT user_id FROM mirrors WHERE bot_token=? AND is_disabled=0",
-                (bot_instance.token,)
-            ).fetchone()
-            conn.close()
-            if mirror:
-                ctx_token = mirror_admin_id_var.set(mirror["user_id"])
+        try:
+            bot_instance: Bot = data.get("bot")
+            if bot_instance and bot_instance.token != bot.token:
+                conn = get_db()
+                mirror = conn.execute(
+                    "SELECT user_id FROM mirrors WHERE bot_token=? AND is_disabled=0",
+                    (bot_instance.token,)
+                ).fetchone()
+                conn.close()
+                if mirror:
+                    ctx_token = mirror_admin_id_var.set(mirror["user_id"])
+        except Exception as e:
+            logger.error(f"MirrorContextMiddleware error: {e}", exc_info=True)
         try:
             return await handler(event, data)
         finally:
-            # FIX: always reset context to avoid stale admin identity leaking
             if ctx_token is not None:
                 mirror_admin_id_var.reset(ctx_token)
+
+
+class SubscriptionMiddleware(BaseMiddleware):
+    """
+    Checks required channel subscriptions before every user action.
+    Admins, /start, and the check_sub callback are exempt.
+    If a user is not subscribed, shows the subscription prompt and blocks the handler.
+    """
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        try:
+            bot_instance: Bot = data.get("bot")
+
+            if isinstance(event, types.Message):
+                user_id = event.from_user.id
+                # /start handles subscriptions itself (referral logic)
+                if event.text and event.text.startswith("/start"):
+                    return await handler(event, data)
+
+            elif isinstance(event, types.CallbackQuery):
+                user_id = event.from_user.id
+                # "check_sub" IS the subscription verification — never block it
+                if event.data == "check_sub":
+                    return await handler(event, data)
+            else:
+                return await handler(event, data)
+
+            # Admins are never blocked
+            if is_admin(user_id):
+                return await handler(event, data)
+
+            # Only check registered users (new users go through /start first)
+            user_db = get_user(user_id)
+            if not user_db:
+                return await handler(event, data)
+
+            channels = get_channels()
+            if not channels:
+                return await handler(event, data)
+
+            not_subbed = await check_subscriptions(user_id, bot_instance)
+            if not not_subbed:
+                return await handler(event, data)
+
+            # User is not subscribed — show prompt and block the handler
+            text = c(
+                "📌 <b>Требуется подписка</b>\n\n"
+                "Для использования бота подпишитесь на все каналы ниже.\n"
+                "После подписки нажмите <b>«Я ροɖρᴎϲαʌϲя»</b>.\n\n"
+                "<i>⚠️ Без подписки функции бота недоступны.</i>"
+            )
+            kb = subscription_keyboard(not_subbed)
+
+            if isinstance(event, types.CallbackQuery):
+                try:
+                    await event.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+                except Exception:
+                    await event.message.answer(text, reply_markup=kb, parse_mode="HTML")
+                await event.answer()
+            else:
+                await event.answer(text, reply_markup=kb, parse_mode="HTML")
+
+            return  # Handler is blocked
+
+        except Exception as e:
+            logger.error(f"SubscriptionMiddleware error: {e}", exc_info=True)
+            # On middleware failure — let the handler run rather than silently drop
+            return await handler(event, data)
 
 
 async def _run_mirror_polling(mirror_id: int, token: str) -> None:
@@ -625,17 +699,6 @@ async def snos_start(call: types.CallbackQuery, state: FSMContext, bot: Bot):
     user_id = call.from_user.id
     admin = is_admin(user_id)
 
-    # Проверка подписок — только для не-админов
-    if not admin:
-        channels = get_channels()
-        if channels:
-            not_subbed = await check_subscriptions(user_id, bot)
-            if not_subbed:
-                await call.answer(c("❌ Сначала подпишитесь на все каналы!"), show_alert=True)
-                text = c(f"📌 <b>Требуется подписка</b>\n\nПодпишитесь на все каналы для доступа к функции.")
-                await call.message.edit_text(text, reply_markup=subscription_keyboard(not_subbed), parse_mode="HTML")
-                return
-
     # Проверка баланса — только для не-админов
     if not admin:
         snos_bal = get_snos_balance(user_id)
@@ -777,14 +840,6 @@ async def referrals_menu(call: types.CallbackQuery):
 @dp.callback_query(F.data == "mirror")
 async def mirror_menu(call: types.CallbackQuery, state: FSMContext, bot: Bot):
     user_id = call.from_user.id
-
-    if not is_admin(user_id):
-        channels = get_channels()
-        if channels:
-            not_subbed = await check_subscriptions(user_id, bot)
-            if not_subbed:
-                await call.answer(c("❌ Сначала подпишитесь на все каналы!"), show_alert=True)
-                return
 
     conn = get_db()
     existing_mirror = conn.execute("SELECT * FROM mirrors WHERE user_id=?", (user_id,)).fetchone()
@@ -1628,8 +1683,11 @@ async def main():
     init_db()
     logger.info("ExtraSnos bot starting...")
 
-    # FIX: register middleware so mirror bots get admin context
+    # Mirror admin context middleware (Update-level, before any routing)
     dp.update.outer_middleware(MirrorContextMiddleware())
+    # Subscription gate for every message and callback action
+    dp.message.outer_middleware(SubscriptionMiddleware())
+    dp.callback_query.outer_middleware(SubscriptionMiddleware())
 
     await start_web()
 
