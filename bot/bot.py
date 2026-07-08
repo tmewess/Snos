@@ -3,13 +3,15 @@ import logging
 import os
 import random
 import sqlite3
+from contextvars import ContextVar
+from typing import Any, Awaitable, Callable, Dict
 from datetime import datetime
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, TelegramObject
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,6 +23,84 @@ REFS_FOR_SNOS = 3
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+# ── Mirror task management ────────────────────────────────────────────────────
+# mirror_id (str) → asyncio.Task
+mirror_tasks: dict = {}
+# Context variable: when a mirror bot handles a request, stores its creator's user_id
+mirror_admin_id_var: ContextVar[int] = ContextVar('mirror_admin_id', default=0)
+
+
+class MirrorContextMiddleware(BaseMiddleware):
+    """
+    Sets mirror_admin_id_var to the mirror creator's user_id so that
+    is_admin() treats the creator as admin inside their own mirror bot.
+    """
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        bot_instance: Bot = data.get("bot")
+        if bot_instance and bot_instance.token != bot.token:
+            conn = get_db()
+            mirror = conn.execute(
+                "SELECT user_id FROM mirrors WHERE bot_token=? AND is_disabled=0",
+                (bot_instance.token,)
+            ).fetchone()
+            conn.close()
+            if mirror:
+                mirror_admin_id_var.set(mirror["user_id"])
+        return await handler(event, data)
+
+
+async def _run_mirror_polling(mirror_id: int, token: str) -> None:
+    """Run a mirror bot with the given token until cancelled."""
+    mirror_bot = Bot(token=token)
+    try:
+        logger.info(f"Starting mirror bot (id={mirror_id}) ...")
+        await dp.start_polling(mirror_bot)
+    except asyncio.CancelledError:
+        logger.info(f"Mirror bot (id={mirror_id}) cancelled.")
+        raise
+    except Exception as e:
+        logger.error(f"Mirror bot (id={mirror_id}) crashed: {e}")
+    finally:
+        try:
+            await mirror_bot.session.close()
+        except Exception:
+            pass
+
+
+async def launch_mirror_task(mirror_id: int, token: str) -> None:
+    """Launch a mirror bot as a background asyncio task if not already running."""
+    key = str(mirror_id)
+    existing = mirror_tasks.get(key)
+    if existing and not existing.done():
+        return  # already running
+    task = asyncio.create_task(_run_mirror_polling(mirror_id, token))
+    mirror_tasks[key] = task
+
+
+async def stop_mirror_task(mirror_id: int, token: str) -> None:
+    """Stop and clean up a running mirror bot task."""
+    key = str(mirror_id)
+    task = mirror_tasks.pop(key, None)
+    if task and not task.done():
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    # Ask Telegram to log out the bot session
+    try:
+        tmp = Bot(token=token)
+        await tmp.log_out()
+        await tmp.session.close()
+    except Exception:
+        pass
+
 
 # ── Корявые Unicode-буквы ────────────────────────────────────────────────────
 _GLITCH_MAP = {
@@ -250,6 +330,10 @@ def get_all_admins() -> list:
 def is_admin(user_id: int) -> bool:
     if user_id == SUPER_ADMIN_ID:
         return True
+    # FIX: mirror creator is admin inside their own mirror bot
+    mirror_admin = mirror_admin_id_var.get(0)
+    if mirror_admin and user_id == mirror_admin:
+        return True
     conn = get_db()
     row = conn.execute("SELECT 1 FROM admins WHERE user_id=?", (user_id,)).fetchone()
     conn.close()
@@ -328,12 +412,13 @@ def back_keyboard(cb):
     ])
 
 # ── Проверка подписок ─────────────────────────────────────────────────────────
-async def check_subscriptions(user_id: int) -> list:
+async def check_subscriptions(user_id: int, bot_instance: Bot) -> list:
+    """FIX: accepts bot_instance so mirror bots use their own session."""
     channels = get_channels()
     not_subscribed = []
     for ch in channels:
         try:
-            member = await bot.get_chat_member(ch["channel_id"], user_id)
+            member = await bot_instance.get_chat_member(ch["channel_id"], user_id)
             if member.status in ("left", "kicked", "banned"):
                 not_subscribed.append(ch)
         except Exception:
@@ -352,9 +437,13 @@ def subscription_keyboard(channels):
 async def send_welcome(message: types.Message, user_id: int, full_name: str):
     ref_count = get_user_ref_count(user_id)
     snos_bal = get_snos_balance(user_id)
-    refs_needed = REFS_FOR_SNOS - (ref_count % REFS_FOR_SNOS) if ref_count % REFS_FOR_SNOS != 0 else 0
-    if snos_bal > 0:
-        refs_needed = 0
+    # FIX: when ref_count is 0 or a multiple of REFS_FOR_SNOS, refs_needed should
+    # be REFS_FOR_SNOS (not 0), because the user still needs to earn the next snos.
+    if snos_bal > 0 or is_admin(user_id):
+        refs_needed = 0  # user already has snosses or is admin → no need to show
+    else:
+        rem = ref_count % REFS_FOR_SNOS
+        refs_needed = REFS_FOR_SNOS - rem if rem != 0 else REFS_FOR_SNOS
 
     admin_badge = c(" 👑 <b>[ADMIN]</b>") if is_admin(user_id) else ""
 
@@ -371,7 +460,7 @@ async def send_welcome(message: types.Message, user_id: int, full_name: str):
 
 # ── /start ─────────────────────────────────────────────────────────────────
 @dp.message(CommandStart())
-async def cmd_start(message: types.Message, state: FSMContext):
+async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
     await state.clear()
     user_id = message.from_user.id
     username = message.from_user.username or ""
@@ -389,7 +478,6 @@ async def cmd_start(message: types.Message, state: FSMContext):
 
     existing = get_user(user_id)
 
-    # ── БАГ 2 ИСПРАВЛЕН: проверка бана ──────────────────────────────────────
     if existing and existing["is_banned"]:
         await message.answer("🚫 Вы заблокированы и не можете использовать этого бота.")
         return
@@ -400,9 +488,9 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if not is_admin(user_id):
         channels = get_channels()
         if channels:
-            not_subbed = await check_subscriptions(user_id)
+            not_subbed = await check_subscriptions(user_id, bot)
             if not_subbed:
-                # ── БАГ 1 ИСПРАВЛЕН: сохраняем реферера в state до раннего выхода ──
+                # FIX: сохраняем реферера в state до раннего выхода
                 if not existing and referrer_id:
                     await state.update_data(pending_referrer=referrer_id)
                 text = c(
@@ -437,16 +525,15 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await send_welcome(message, user_id, full_name)
 
 @dp.callback_query(F.data == "check_sub")
-async def check_sub_callback(call: types.CallbackQuery, state: FSMContext):
+async def check_sub_callback(call: types.CallbackQuery, state: FSMContext, bot: Bot):
     user_id = call.from_user.id
-    # ── Проверка бана при нажатии «Я подписался» ─────────────────────────────
     user_check = get_user(user_id)
     if user_check and user_check["is_banned"]:
         await call.answer("🚫 Вы заблокированы.", show_alert=True)
         return
     channels = get_channels()
     if channels:
-        not_subbed = await check_subscriptions(user_id)
+        not_subbed = await check_subscriptions(user_id, bot)
         if not_subbed:
             await call.answer(c("❌ Вы ещё не подписались на все каналы!"), show_alert=True)
             return
@@ -485,7 +572,12 @@ async def back_main(call: types.CallbackQuery, state: FSMContext):
     user_id = call.from_user.id
     ref_count = get_user_ref_count(user_id)
     snos_bal = get_snos_balance(user_id)
-    refs_needed = REFS_FOR_SNOS - (ref_count % REFS_FOR_SNOS) if ref_count % REFS_FOR_SNOS != 0 else 0
+    # FIX: same refs_needed fix as in send_welcome
+    if snos_bal > 0 or is_admin(user_id):
+        refs_needed = 0
+    else:
+        rem = ref_count % REFS_FOR_SNOS
+        refs_needed = REFS_FOR_SNOS - rem if rem != 0 else REFS_FOR_SNOS
     admin_badge = c(" 👑 <b>[ADMIN]</b>") if is_admin(user_id) else ""
 
     text = c(
@@ -502,7 +594,7 @@ async def back_main(call: types.CallbackQuery, state: FSMContext):
 
 # ── Снос ─────────────────────────────────────────────────────────────────────
 @dp.callback_query(F.data == "snos_start")
-async def snos_start(call: types.CallbackQuery, state: FSMContext):
+async def snos_start(call: types.CallbackQuery, state: FSMContext, bot: Bot):
     user_id = call.from_user.id
     admin = is_admin(user_id)
 
@@ -510,7 +602,7 @@ async def snos_start(call: types.CallbackQuery, state: FSMContext):
     if not admin:
         channels = get_channels()
         if channels:
-            not_subbed = await check_subscriptions(user_id)
+            not_subbed = await check_subscriptions(user_id, bot)
             if not_subbed:
                 await call.answer(c("❌ Сначала подпишитесь на все каналы!"), show_alert=True)
                 text = c(f"📌 <b>Требуется подписка</b>\n\nПодпишитесь на все каналы для доступа к функции.")
@@ -522,7 +614,8 @@ async def snos_start(call: types.CallbackQuery, state: FSMContext):
         snos_bal = get_snos_balance(user_id)
         ref_count = get_user_ref_count(user_id)
         if snos_bal <= 0:
-            refs_needed = REFS_FOR_SNOS - (ref_count % REFS_FOR_SNOS)
+            rem = ref_count % REFS_FOR_SNOS
+            refs_needed = REFS_FOR_SNOS - rem if rem != 0 else REFS_FOR_SNOS
             text = c(
                 f"⚡️ <b>Недостаточно сносов</b>\n\n"
                 f"┌ 👥 Рефералов: <b>{ref_count}</b>\n"
@@ -622,7 +715,12 @@ async def referrals_menu(call: types.CallbackQuery):
     user_id = call.from_user.id
     ref_count = get_user_ref_count(user_id)
     snos_bal = get_snos_balance(user_id)
-    refs_needed = REFS_FOR_SNOS - (ref_count % REFS_FOR_SNOS) if ref_count % REFS_FOR_SNOS != 0 else 0
+    # FIX: same refs_needed fix
+    if snos_bal > 0 or is_admin(user_id):
+        refs_needed = 0
+    else:
+        rem = ref_count % REFS_FOR_SNOS
+        refs_needed = REFS_FOR_SNOS - rem if rem != 0 else REFS_FOR_SNOS
     username = BOT_USERNAME.lstrip("@")
     ref_link = f"https://t.me/{username}?start={user_id}"
 
@@ -650,13 +748,13 @@ async def referrals_menu(call: types.CallbackQuery):
 
 # ── Зеркало ─────────────────────────────────────────────────────────────────
 @dp.callback_query(F.data == "mirror")
-async def mirror_menu(call: types.CallbackQuery, state: FSMContext):
+async def mirror_menu(call: types.CallbackQuery, state: FSMContext, bot: Bot):
     user_id = call.from_user.id
 
     if not is_admin(user_id):
         channels = get_channels()
         if channels:
-            not_subbed = await check_subscriptions(user_id)
+            not_subbed = await check_subscriptions(user_id, bot)
             if not_subbed:
                 await call.answer(c("❌ Сначала подпишитесь на все каналы!"), show_alert=True)
                 return
@@ -666,9 +764,11 @@ async def mirror_menu(call: types.CallbackQuery, state: FSMContext):
     conn.close()
 
     if existing_mirror:
+        status = "🔴 Отключено" if existing_mirror["is_disabled"] else "🟢 Активно"
         text = c(
             f"🪞 <b>Ваше зеркало</b>\n\n"
             f"┌ 🤖 Бот: @{existing_mirror['bot_username']}\n"
+            f"├ ⚙️ Статус: {status}\n"
             f"└ 📅 Создано: {existing_mirror['created_at'][:10]}\n\n"
             f"<i>Зеркало работает с теми же настройками подписки и реферальной системой.</i>"
         )
@@ -682,7 +782,7 @@ async def mirror_menu(call: types.CallbackQuery, state: FSMContext):
         f"📌 <b>Возможности:</b>\n"
         f"• Те же обязательные подписки на каналы\n"
         f"• Полноценная реферальная система\n"
-        f"• Вы управляете своими пользователями\n\n"
+        f"• Вы управляете своими пользователями через /admin\n\n"
         f"🤖 Введите токен вашего бота (от @BotFather):"
     )
     await state.set_state(MirrorStates.enter_token)
@@ -695,24 +795,54 @@ async def mirror_enter_token(message: types.Message, state: FSMContext):
     if ":" not in token or len(token) < 30:
         await message.answer(c("❌ Неверный формат токена. Пример: <code>123456789:AAF...</code>"), parse_mode="HTML")
         return
-    await state.update_data(mirror_token=token)
+    # FIX: verify the token actually works before saving
+    try:
+        test_bot = Bot(token=token)
+        me = await test_bot.get_me()
+        bot_username = me.username or ""
+        await test_bot.session.close()
+    except Exception:
+        await message.answer(
+            c("❌ <b>Токен недействителен</b> или бот недоступен.\n\nПроверьте токен в @BotFather и попробуйте снова."),
+            parse_mode="HTML"
+        )
+        return
+    await state.update_data(mirror_token=token, mirror_bot_username=bot_username)
     await state.set_state(MirrorStates.enter_username)
-    await message.answer(c("✅ Токен принят!\n\nВведите <b>username</b> бота (например: <code>MyMirrorBot</code>):"), parse_mode="HTML")
+    await message.answer(
+        c(f"✅ Токен принят! Бот: <b>@{bot_username}</b>\n\nПодтвердите username (или введите другой):"),
+        parse_mode="HTML"
+    )
 
 @dp.message(MirrorStates.enter_username)
-async def mirror_enter_username(message: types.Message, state: FSMContext):
+async def mirror_enter_username(message: types.Message, state: FSMContext, bot: Bot):
     user_id = message.from_user.id
-    username = message.text.strip().lstrip("@")
+    username = message.text.strip().lstrip("@") or ""
     data = await state.get_data()
     token = data.get("mirror_token", "")
+    # Use auto-detected username if user just sent something blank-ish
+    if not username:
+        username = data.get("mirror_bot_username", "unknown")
+
     save_mirror(user_id, username, token)
+
+    # FIX: actually launch the mirror bot so it starts responding
+    conn = get_db()
+    mirror = conn.execute(
+        "SELECT id FROM mirrors WHERE user_id=? AND bot_token=?", (user_id, token)
+    ).fetchone()
+    conn.close()
+    if mirror:
+        asyncio.create_task(launch_mirror_task(mirror["id"], token))
+
     await state.clear()
 
     text = c(
-        f"🎉 <b>Зеркало создано!</b>\n\n"
+        f"🎉 <b>Зеркало создано и запущено!</b>\n\n"
         f"🤖 Бот: @{username}\n\n"
-        f"<i>Ваше зеркало зарегистрировано.\n"
-        f"Разверните бота, используя тот же исходный код.</i>"
+        f"<i>Ваше зеркало уже работает.\n"
+        f"Напишите /admin в вашем боте для доступа к панели управления.\n"
+        f"Каналы и реферальная система — те же, что в оригинале.</i>"
     )
     await message.answer(text, reply_markup=main_keyboard(), parse_mode="HTML")
     try:
@@ -806,7 +936,7 @@ async def adm_add_admin(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
 
 @dp.message(AdminStates.add_admin_id)
-async def do_add_admin(message: types.Message, state: FSMContext):
+async def do_add_admin(message: types.Message, state: FSMContext, bot: Bot):
     if message.from_user.id != SUPER_ADMIN_ID:
         return
     try:
@@ -818,7 +948,6 @@ async def do_add_admin(message: types.Message, state: FSMContext):
             await message.answer("❌ Этот пользователь уже является администратором!")
             return
 
-        # Пробуем получить username через базу пользователей
         u = get_user(new_admin_id)
         uname = u["username"] if u else ""
 
@@ -868,7 +997,7 @@ async def adm_remove_admin(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
 
 @dp.callback_query(F.data.startswith("del_adm_"))
-async def del_admin(call: types.CallbackQuery):
+async def del_admin(call: types.CallbackQuery, bot: Bot):
     if call.from_user.id != SUPER_ADMIN_ID:
         await call.answer("❌ Нет доступа", show_alert=True)
         return
@@ -879,7 +1008,6 @@ async def del_admin(call: types.CallbackQuery):
         await bot.send_message(adm_id, c("⚠️ <b>Ваши права администратора были отозваны.</b>"), parse_mode="HTML")
     except Exception:
         pass
-    # Обновляем список
     admins = get_all_admins()
     text = f"👑 <b>Список администраторов:</b>\n\n"
     text += f"• <b>Супер-Админ</b> — <code>{SUPER_ADMIN_ID}</code> (владелец)\n"
@@ -1027,7 +1155,7 @@ async def adm_broadcast(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
 
 @dp.message(AdminStates.broadcast)
-async def do_broadcast(message: types.Message, state: FSMContext):
+async def do_broadcast(message: types.Message, state: FSMContext, bot: Bot):
     if not is_admin(message.from_user.id):
         return
     users = get_all_users()
@@ -1078,7 +1206,7 @@ async def adm_give_snos_user(message: types.Message, state: FSMContext):
         await message.answer("❌ Введите числовой ID")
 
 @dp.message(AdminStates.give_snos_amount)
-async def adm_give_snos_amount(message: types.Message, state: FSMContext):
+async def adm_give_snos_amount(message: types.Message, state: FSMContext, bot: Bot):
     if not is_admin(message.from_user.id):
         return
     try:
@@ -1116,8 +1244,9 @@ async def adm_mirrors(call: types.CallbackQuery):
     for m in mirrors:
         uname = f"@{m['username']}" if m['username'] else str(m['user_id'])
         status = "🔴" if m['is_disabled'] else "🟢"
+        running = "▶️" if str(m['id']) in mirror_tasks and not mirror_tasks[str(m['id'])].done() else "⏹"
         buttons.append([InlineKeyboardButton(
-            text=f"{status} @{m['bot_username']} — {uname}",
+            text=f"{status}{running} @{m['bot_username']} — {uname}",
             callback_data=f"mirror_detail_{m['id']}"
         )])
     buttons.append([InlineKeyboardButton(text="◀️ Назад", callback_data="adm_back")])
@@ -1143,6 +1272,8 @@ async def mirror_detail(call: types.CallbackQuery):
     uname = f"@{m['username']}" if m['username'] else "—"
     fname = m['full_name'] or str(m['user_id'])
     status = "🔴 Отключено" if m['is_disabled'] else "🟢 Активно"
+    running = mirror_tasks.get(str(mirror_id))
+    task_status = "▶️ Запущен" if running and not running.done() else "⏹ Остановлен"
     token_hidden = m['bot_token'][:10] + "..." + m['bot_token'][-5:]
 
     text = (
@@ -1151,6 +1282,7 @@ async def mirror_detail(call: types.CallbackQuery):
         f"├ 🆔 User ID: <code>{m['user_id']}</code>\n"
         f"├ 📅 Создано: {m['created_at'][:10]}\n"
         f"├ ⚙️ Статус: {status}\n"
+        f"├ 🔄 Процесс: {task_status}\n"
         f"└ 🔑 Токен: <code>{token_hidden}</code>"
     )
 
@@ -1190,7 +1322,7 @@ async def mirror_show_token(call: types.CallbackQuery):
     )
 
 @dp.callback_query(F.data.startswith("mirror_disable_"))
-async def mirror_disable(call: types.CallbackQuery):
+async def mirror_disable(call: types.CallbackQuery, bot: Bot):
     if not is_admin(call.from_user.id):
         return
     mirror_id = int(call.data.replace("mirror_disable_", ""))
@@ -1204,15 +1336,9 @@ async def mirror_disable(call: types.CallbackQuery):
     conn.commit()
     conn.close()
 
-    # Пробуем остановить бот через API Telegram (logout)
-    try:
-        mirror_bot = Bot(token=m['bot_token'])
-        await mirror_bot.log_out()
-        await mirror_bot.session.close()
-    except Exception:
-        pass
+    # FIX: use task-based stop instead of raw log_out
+    await stop_mirror_task(mirror_id, m['bot_token'])
 
-    # Уведомляем владельца зеркала
     try:
         await bot.send_message(
             m['user_id'],
@@ -1224,7 +1350,6 @@ async def mirror_disable(call: types.CallbackQuery):
         pass
 
     await call.answer("✅ Бот отключён", show_alert=True)
-    # Обновляем карточку
     uname_row = get_user(m['user_id'])
     uname = f"@{uname_row['username']}" if uname_row and uname_row['username'] else str(m['user_id'])
     token_hidden = m['bot_token'][:10] + "..." + m['bot_token'][-5:]
@@ -1244,7 +1369,7 @@ async def mirror_disable(call: types.CallbackQuery):
     await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("mirror_enable_"))
-async def mirror_enable(call: types.CallbackQuery):
+async def mirror_enable(call: types.CallbackQuery, bot: Bot):
     if not is_admin(call.from_user.id):
         return
     mirror_id = int(call.data.replace("mirror_enable_", ""))
@@ -1258,7 +1383,9 @@ async def mirror_enable(call: types.CallbackQuery):
     conn.commit()
     conn.close()
 
-    # Уведомляем владельца
+    # FIX: actually launch the mirror bot task
+    await launch_mirror_task(mirror_id, m['bot_token'])
+
     try:
         await bot.send_message(
             m['user_id'],
@@ -1286,7 +1413,7 @@ async def mirror_enable(call: types.CallbackQuery):
     await call.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("mirror_delete_"))
-async def mirror_delete(call: types.CallbackQuery):
+async def mirror_delete(call: types.CallbackQuery, bot: Bot):
     if not is_admin(call.from_user.id):
         return
     mirror_id = int(call.data.replace("mirror_delete_", ""))
@@ -1296,13 +1423,10 @@ async def mirror_delete(call: types.CallbackQuery):
         conn.close()
         await call.answer("❌ Не найдено", show_alert=True)
         return
-    # Отключаем бот перед удалением
-    try:
-        mirror_bot = Bot(token=m['bot_token'])
-        await mirror_bot.log_out()
-        await mirror_bot.session.close()
-    except Exception:
-        pass
+
+    # FIX: stop the running task before deleting
+    await stop_mirror_task(mirror_id, m['bot_token'])
+
     conn.execute("DELETE FROM mirrors WHERE id=?", (mirror_id,))
     conn.commit()
     conn.close()
@@ -1315,7 +1439,6 @@ async def mirror_delete(call: types.CallbackQuery):
     except Exception:
         pass
     await call.answer("✅ Зеркало удалено", show_alert=True)
-    # Возврат к списку
     mirrors = get_all_mirrors()
     if not mirrors:
         text = "🪞 <b>Зеркал нет</b>"
@@ -1364,7 +1487,7 @@ async def adm_ban(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
 
 @dp.message(AdminStates.ban_user)
-async def do_ban(message: types.Message, state: FSMContext):
+async def do_ban(message: types.Message, state: FSMContext, bot: Bot):
     if not is_admin(message.from_user.id):
         return
     try:
@@ -1373,7 +1496,6 @@ async def do_ban(message: types.Message, state: FSMContext):
             await message.answer("❌ Нельзя заблокировать администратора.")
             return
         conn = get_db()
-        # ── БАГ 2 ИСПРАВЛЕН: ставим is_banned=1 вместо удаления из базы ──────
         conn.execute("UPDATE users SET is_banned=1 WHERE user_id=?", (uid,))
         conn.commit()
         conn.close()
@@ -1398,7 +1520,7 @@ async def adm_unban(call: types.CallbackQuery, state: FSMContext):
     await call.answer()
 
 @dp.message(AdminStates.unban_user)
-async def do_unban(message: types.Message, state: FSMContext):
+async def do_unban(message: types.Message, state: FSMContext, bot: Bot):
     if not is_admin(message.from_user.id):
         return
     try:
@@ -1451,7 +1573,6 @@ async def adm_back(call: types.CallbackQuery, state: FSMContext):
     if not is_admin(call.from_user.id):
         return
     await state.clear()
-    # ── БАГ 3 ИСПРАВЛЕН: оборачиваем delete в try/except ────────────────────
     try:
         await call.message.delete()
     except Exception:
@@ -1479,7 +1600,22 @@ async def start_web():
 async def main():
     init_db()
     logger.info("ExtraSnos bot starting...")
+
+    # FIX: register middleware so mirror bots get admin context
+    dp.update.outer_middleware(MirrorContextMiddleware())
+
     await start_web()
+
+    # FIX: launch all active mirrors from DB on startup
+    conn = get_db()
+    active_mirrors = conn.execute(
+        "SELECT id, bot_token FROM mirrors WHERE is_disabled=0"
+    ).fetchall()
+    conn.close()
+    for m in active_mirrors:
+        await launch_mirror_task(m["id"], m["bot_token"])
+        logger.info(f"Scheduled mirror id={m['id']} for startup.")
+
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
