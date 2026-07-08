@@ -320,6 +320,12 @@ def init_db():
         conn.commit()
     except Exception:
         pass
+    # Migration: add is_banned to users table if missing (old DBs may not have it)
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass
     conn.commit()
     conn.close()
 
