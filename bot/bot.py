@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import random
+import re
 import sqlite3
 from contextvars import ContextVar
 from typing import Any, Awaitable, Callable, Dict
@@ -264,6 +265,24 @@ def get_db():
     conn = sqlite3.connect(os.path.join(os.path.dirname(os.path.abspath(__file__)), "data.db"))
     conn.row_factory = sqlite3.Row
     return conn
+
+
+def parse_telegram_target(text: str):
+    """
+    Validates and normalises a Telegram username / link.
+    Returns (True, "@username") on success or (False, "") on failure.
+    Accepts: @username, t.me/username, https://t.me/username
+    Username rules: 5-32 chars, letters/digits/underscores, must start with a letter.
+    """
+    t = text.strip()
+    for prefix in ("https://t.me/", "http://t.me/", "t.me/", "@"):
+        if t.lower().startswith(prefix.lower()):
+            t = t[len(prefix):]
+            break
+    t = t.split("?")[0].split("/")[0].strip()
+    if re.fullmatch(r"[a-zA-Z][a-zA-Z0-9_]{4,31}", t):
+        return True, f"@{t}"
+    return False, ""
 
 def init_db():
     conn = get_db()
@@ -772,11 +791,25 @@ async def snos_reason_chosen(call: types.CallbackQuery, state: FSMContext):
 @dp.message(SnosStates.enter_target)
 async def snos_enter_target(message: types.Message, state: FSMContext):
     user_id = message.from_user.id
-    target = message.text.strip()
+    raw = message.text.strip()
     data = await state.get_data()
     target_type = data.get("target_type", "Цель")
     reason = data.get("reason", "Прочее")
     admin = is_admin(user_id)
+
+    # Validate: must be a real Telegram username or link
+    valid, target = parse_telegram_target(raw)
+    if not valid:
+        await message.answer(
+            c(
+                "❌ <b>Неверный формат!</b>\n\n"
+                "Введите настоящий Telegram-юзернейм или ссылку:\n"
+                "<i>Пример: @example, t.me/example</i>\n\n"
+                "Юзернейм: от 5 до 32 символов (буквы, цифры, _)."
+            ),
+            parse_mode="HTML",
+        )
+        return  # stay in the same state so user can re-enter
 
     if not admin:
         snos_bal = get_snos_balance(user_id)
@@ -807,7 +840,7 @@ async def snos_enter_target(message: types.Message, state: FSMContext):
 
 # ── Рефералы ─────────────────────────────────────────────────────────────────
 @dp.callback_query(F.data == "referrals")
-async def referrals_menu(call: types.CallbackQuery):
+async def referrals_menu(call: types.CallbackQuery, bot: Bot):
     user_id = call.from_user.id
     ref_count = get_user_ref_count(user_id)
     snos_bal = get_snos_balance(user_id)
@@ -817,7 +850,9 @@ async def referrals_menu(call: types.CallbackQuery):
     else:
         rem = ref_count % REFS_FOR_SNOS
         refs_needed = REFS_FOR_SNOS - rem if rem != 0 else REFS_FOR_SNOS
-    username = BOT_USERNAME.lstrip("@")
+    # Use the current bot's real username — works for mirrors too
+    me = await bot.get_me()
+    username = me.username or BOT_USERNAME.lstrip("@")
     ref_link = f"https://t.me/{username}?start={user_id}"
 
     text = c(
