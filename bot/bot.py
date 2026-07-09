@@ -941,10 +941,17 @@ async def mirror_enter_token(message: types.Message, state: FSMContext):
         return
     await state.update_data(mirror_token=token, mirror_bot_username=bot_username)
     await state.set_state(MirrorStates.enter_username)
+    # Security: delete the message containing the token so it doesn't stay in chat history
+    try:
+        await message.delete()
+    except Exception:
+        pass
     await message.answer(
         c(f"✅ Токен принят! Бот: <b>@{bot_username}</b>\n\nПодтвердите username (или введите другой):"),
         parse_mode="HTML"
     )
+
+MAX_MIRRORS_PER_USER = 5
 
 @dp.message(MirrorStates.enter_username)
 async def mirror_enter_username(message: types.Message, state: FSMContext, bot: Bot):
@@ -955,6 +962,20 @@ async def mirror_enter_username(message: types.Message, state: FSMContext, bot: 
     # Use auto-detected username if user just sent something blank-ish
     if not username:
         username = data.get("mirror_bot_username", "unknown")
+
+    # Security: limit mirrors per user to prevent resource exhaustion
+    conn = get_db()
+    mirror_count = conn.execute(
+        "SELECT COUNT(*) FROM mirrors WHERE user_id=?", (user_id,)
+    ).fetchone()[0]
+    conn.close()
+    if not is_admin(user_id) and mirror_count >= MAX_MIRRORS_PER_USER:
+        await state.clear()
+        await message.answer(
+            c(f"❌ <b>Лимит зеркал исчерпан!</b>\n\nМаксимум: {MAX_MIRRORS_PER_USER} зеркал на аккаунт.\nУдалите старое зеркало, чтобы создать новое."),
+            reply_markup=main_keyboard(), parse_mode="HTML"
+        )
+        return
 
     save_mirror(user_id, username, token)
 
@@ -1277,7 +1298,8 @@ async def adm_users(call: types.CallbackQuery):
 
 @dp.callback_query(F.data == "adm_broadcast")
 async def adm_broadcast(call: types.CallbackQuery, state: FSMContext):
-    if not is_admin(call.from_user.id):
+    if call.from_user.id != SUPER_ADMIN_ID:
+        await call.answer("❌ Только супер-админ может делать рассылку.", show_alert=True)
         return
     await state.set_state(AdminStates.broadcast)
     await call.message.edit_text(
@@ -1288,7 +1310,7 @@ async def adm_broadcast(call: types.CallbackQuery, state: FSMContext):
 
 @dp.message(AdminStates.broadcast)
 async def do_broadcast(message: types.Message, state: FSMContext, bot: Bot):
-    if not is_admin(message.from_user.id):
+    if message.from_user.id != SUPER_ADMIN_ID:
         return
     users = get_all_users()
     text = message.text or message.caption or ""
@@ -1432,7 +1454,8 @@ async def mirror_detail(call: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("mirror_token_"))
 async def mirror_show_token(call: types.CallbackQuery):
-    if not is_admin(call.from_user.id):
+    if call.from_user.id != SUPER_ADMIN_ID:
+        await call.answer("❌ Только супер-админ может просматривать полные токены.", show_alert=True)
         return
     mirror_id = int(call.data.replace("mirror_token_", ""))
     conn = get_db()
@@ -1455,7 +1478,8 @@ async def mirror_show_token(call: types.CallbackQuery):
 
 @dp.callback_query(F.data.startswith("mirror_disable_"))
 async def mirror_disable(call: types.CallbackQuery, bot: Bot):
-    if not is_admin(call.from_user.id):
+    if call.from_user.id != SUPER_ADMIN_ID:
+        await call.answer("❌ Только супер-админ может управлять зеркалами.", show_alert=True)
         return
     mirror_id = int(call.data.replace("mirror_disable_", ""))
     conn = get_db()
@@ -1502,7 +1526,8 @@ async def mirror_disable(call: types.CallbackQuery, bot: Bot):
 
 @dp.callback_query(F.data.startswith("mirror_enable_"))
 async def mirror_enable(call: types.CallbackQuery, bot: Bot):
-    if not is_admin(call.from_user.id):
+    if call.from_user.id != SUPER_ADMIN_ID:
+        await call.answer("❌ Только супер-админ может управлять зеркалами.", show_alert=True)
         return
     mirror_id = int(call.data.replace("mirror_enable_", ""))
     conn = get_db()
@@ -1546,7 +1571,8 @@ async def mirror_enable(call: types.CallbackQuery, bot: Bot):
 
 @dp.callback_query(F.data.startswith("mirror_delete_"))
 async def mirror_delete(call: types.CallbackQuery, bot: Bot):
-    if not is_admin(call.from_user.id):
+    if call.from_user.id != SUPER_ADMIN_ID:
+        await call.answer("❌ Только супер-админ может удалять зеркала.", show_alert=True)
         return
     mirror_id = int(call.data.replace("mirror_delete_", ""))
     conn = get_db()
@@ -1730,6 +1756,12 @@ async def start_web():
 
 # ── Запуск ─────────────────────────────────────────────────────────────────
 async def main():
+    if not BOT_TOKEN:
+        logger.critical("BOT_TOKEN is not set. Set the BOT_TOKEN environment variable and restart.")
+        return
+    if not SUPER_ADMIN_ID:
+        logger.critical("ADMIN_ID is not set. Set the ADMIN_ID environment variable and restart.")
+        return
     init_db()
     logger.info("ExtraSnos bot starting...")
 
