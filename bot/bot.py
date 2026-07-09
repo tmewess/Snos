@@ -295,7 +295,8 @@ def init_db():
             ref_count INTEGER DEFAULT 0,
             snos_balance INTEGER DEFAULT 0,
             joined_at TEXT,
-            is_banned INTEGER DEFAULT 0
+            is_banned INTEGER DEFAULT 0,
+            ref_credited INTEGER DEFAULT 0
         );
         CREATE TABLE IF NOT EXISTS admins (
             user_id INTEGER PRIMARY KEY,
@@ -342,6 +343,12 @@ def init_db():
     # Migration: add is_banned to users table if missing (old DBs may not have it)
     try:
         conn.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
+        conn.commit()
+    except Exception:
+        pass
+    # Migration: add ref_credited to track whether a referral was already counted
+    try:
+        conn.execute("ALTER TABLE users ADD COLUMN ref_credited INTEGER DEFAULT 0")
         conn.commit()
     except Exception:
         pass
@@ -405,6 +412,53 @@ def add_ref(referrer_id):
     conn.commit()
     conn.close()
     return got
+
+
+async def maybe_credit_referrer(user_id: int, bot: Bot):
+    """
+    Credits the referrer of user_id exactly once, using the ref_credited flag
+    in the DB so it is safe to call from both cmd_start and check_sub_callback
+    without relying on volatile FSM state.
+    """
+    user = get_user(user_id)
+    if not user:
+        return
+    try:
+        referrer_id = user["referrer_id"]
+        ref_credited = user["ref_credited"]
+    except (IndexError, KeyError):
+        return
+    if not referrer_id or ref_credited:
+        return
+    # Mark credited first to prevent double-credit on race / duplicate updates
+    conn = get_db()
+    conn.execute("UPDATE users SET ref_credited=1 WHERE user_id=? AND ref_credited=0", (user_id,))
+    rows_updated = conn.execute("SELECT changes()").fetchone()[0]
+    conn.commit()
+    conn.close()
+    if not rows_updated:
+        return  # another call already credited it
+    ref_user = get_user(referrer_id)
+    if not ref_user:
+        return
+    got_snos = add_ref(referrer_id)
+    ref_count_now = get_user_ref_count(referrer_id)
+    left = REFS_FOR_SNOS - (ref_count_now % REFS_FOR_SNOS)
+    if left == REFS_FOR_SNOS:
+        left = 0
+    notify = c(
+        f"🎉 <b>Новый реферал!</b>\n\n"
+        f"👤 Пользователь присоединился и подписался.\n"
+        f"👥 Всего рефералов: <b>{ref_count_now}</b>\n"
+    )
+    if got_snos:
+        notify += c(f"⚡️ <b>+1 снос начислен!</b> Поздравляем!")
+    else:
+        notify += c(f"📊 До следующего сноса: <b>{left} реф.</b>")
+    try:
+        await bot.send_message(referrer_id, notify, parse_mode="HTML")
+    except Exception:
+        pass
 
 def get_all_users():
     conn = get_db()
@@ -613,9 +667,6 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
         if channels:
             not_subbed = await check_subscriptions(user_id, bot)
             if not_subbed:
-                # FIX: сохраняем реферера в state до раннего выхода
-                if not existing and referrer_id:
-                    await state.update_data(pending_referrer=referrer_id)
                 text = c(
                     f"🛡 <b>ExtraSnos</b>\n\n"
                     f"Для доступа к боту подпишитесь на все каналы ниже.\n"
@@ -625,26 +676,8 @@ async def cmd_start(message: types.Message, state: FSMContext, bot: Bot):
                 await message.answer(text, reply_markup=subscription_keyboard(not_subbed), parse_mode="HTML")
                 return
 
-    if not existing and referrer_id:
-        ref_user = get_user(referrer_id)
-        if ref_user:
-            got_snos = add_ref(referrer_id)
-            ref_count_now = get_user_ref_count(referrer_id)
-            notify = c(
-                f"🎉 <b>Новый реферал!</b>\n\n"
-                f"👤 Пользователь присоединился по вашей ссылке.\n"
-                f"👥 Всего рефералов: <b>{ref_count_now}</b>\n"
-            )
-            if got_snos:
-                notify += c(f"⚡️ <b>+1 снос начислен!</b> Поздравляем!")
-            else:
-                left = REFS_FOR_SNOS - (ref_count_now % REFS_FOR_SNOS)
-                notify += c(f"📊 До следующего сноса: <b>{left} реф.</b>")
-            try:
-                await bot.send_message(referrer_id, notify, parse_mode="HTML")
-            except Exception:
-                pass
-
+    # Credit referrer after subscription confirmed (or immediately if no channels required)
+    await maybe_credit_referrer(user_id, bot)
     await send_welcome(message, user_id, full_name)
 
 @dp.callback_query(F.data == "check_sub")
@@ -661,32 +694,8 @@ async def check_sub_callback(call: types.CallbackQuery, state: FSMContext, bot: 
             await call.answer(c("❌ Вы ещё не подписались на все каналы!"), show_alert=True)
             return
 
-    data = await state.get_data()
-    referrer_id = data.get("pending_referrer")
-
-    if referrer_id:
-        # FIX: clear pending_referrer immediately to prevent double-credit on
-        # repeated taps or duplicate callback deliveries
-        await state.update_data(pending_referrer=None)
-        existing_check = get_user(user_id)
-        ref_user = get_user(referrer_id)
-        if ref_user and existing_check and existing_check["referrer_id"] == referrer_id:
-            got_snos = add_ref(referrer_id)
-            ref_count_now = get_user_ref_count(referrer_id)
-            notify = c(
-                f"🎉 <b>Новый реферал!</b>\n\n"
-                f"👤 Пользователь подписался и засчитан.\n"
-                f"👥 Всего рефералов: <b>{ref_count_now}</b>\n"
-            )
-            if got_snos:
-                notify += c(f"⚡️ <b>+1 снос начислен!</b>")
-            else:
-                left = REFS_FOR_SNOS - (ref_count_now % REFS_FOR_SNOS)
-                notify += c(f"📊 До следующего сноса: <b>{left} реф.</b>")
-            try:
-                await bot.send_message(referrer_id, notify, parse_mode="HTML")
-            except Exception:
-                pass
+    # Credit referrer now that the user has subscribed to all required channels
+    await maybe_credit_referrer(user_id, bot)
 
     await call.message.delete()
     await send_welcome(call.message, user_id, call.from_user.full_name)
